@@ -349,11 +349,11 @@ const CRYPTO = async (op, fields = {}) => {
 
 // One harness for every Libby test. `libbyHandler` decides what the Libby host
 // answers so each test can shape only the calls it cares about.
-async function renderLibby({ libbyHandler, storedLibby, storedCredential } = {}) {
+async function renderLibby({ libbyHandler, storedLibby, storedCredential, syncDownload, syncRead, syncDelete } = {}) {
   const document = fakeDocument(LIBBY_IDS);
   const state = {
     writes: [], downloads: [], deletes: [], relayCalls: [], chipCalls: [],
-    fulfillmentOperations: [], mkdirs: [],
+    fulfillmentOperations: [], mkdirs: [], syncFiles: new Map(),
     savedCredential: storedCredential || '',
     storedLibby: storedLibby || null,
   };
@@ -391,6 +391,13 @@ async function renderLibby({ libbyHandler, storedLibby, storedCredential } = {})
     },
     async fetchToSd(url, dest, headers) {
       state.downloads.push({ url, dest, headers });
+      if (url === 'https://sentry.libbyapp.com/chip/sync') {
+        const r = syncDownload
+          ? await syncDownload(url, dest, headers, state)
+          : { status: 200, body: JSON.stringify(SYNC_PAYLOAD) };
+        if (r.status >= 200 && r.status < 300 && !r.error) state.syncFiles.set(dest, r.body);
+        return { status: r.status, error: r.error, complete: r.complete, bytes: r.body?.length || 0 };
+      }
       state.fulfillmentOperations.push('download');
       return { status: 200, bytes: 4321 };
     },
@@ -402,7 +409,10 @@ async function renderLibby({ libbyHandler, storedLibby, storedCredential } = {})
       return response();
     }
     if (url === '/delete') {
-      state.deletes.push(new URLSearchParams(options.body).get('path'));
+      const path = new URLSearchParams(options.body).get('path');
+      state.deletes.push(path);
+      if (syncDelete && state.syncFiles.has(path)) return syncDelete(path, state);
+      state.syncFiles.delete(path);
       return response();
     }
     if (url.startsWith('/api/files')) {
@@ -415,6 +425,9 @@ async function renderLibby({ libbyHandler, storedLibby, storedCredential } = {})
     }
     if (url.startsWith('/download')) {
       const path = new URLSearchParams(url.split('?')[1]).get('path');
+      if (state.syncFiles.has(path)) {
+        return syncRead ? syncRead(path, state) : response({ text: state.syncFiles.get(path) });
+      }
       if (path === '/.crosspoint/content.key') {
         return state.savedCredential
           ? response({ text: state.savedCredential }) : response({ status: 404 });
@@ -705,17 +718,144 @@ test('libby names each step while linking instead of going silent', async () => 
   assert.match(joined, /Reading your library/);
 });
 
-test('libby explains an oversized sync instead of leaking the relay error', async () => {
+test('libby downloads an oversized sync after the firmware host throws HTTP 502', async () => {
+  const large = JSON.stringify({ ...SYNC_PAYLOAD, padding: 'x'.repeat(335659) });
+  const handler = libbyOk({ before: (method, url) => {
+    if (url.endsWith('/chip/sync')) {
+      const error = new Error('/api/relay 502: relay failed; large bodies need /api/fetch');
+      error.status = 502;
+      throw error;
+    }
+  } });
+  const { document, state } = await renderLibby({
+    libbyHandler: handler, storedLibby: LINKED,
+    syncDownload: async (url, dest, headers) => {
+      assert.equal(headers.Authorization, 'Bearer ' + LINKED.identity);
+      assert.equal(headers.Origin, 'https://libbyapp.com');
+      assert.equal(headers['User-Agent'], undefined);
+      return { status: 200, body: large };
+    },
+  });
+  assert.match(document.elements['lby-loans'].innerHTML, /Adobe Book/);
+  assert.match(document.elements['lby-loans'].innerHTML, /Open Book/);
+  assert.equal(state.downloads.length, 1);
+  assert.match(state.downloads[0].dest, /^\/\.crosspoint\/plugins\/libby\/sync-[a-z0-9-]+\.json$/);
+  assert.ok(state.deletes.includes(state.downloads[0].dest));
+  assert.equal(state.syncFiles.size, 0, 'the library response must not be retained on SD');
+});
+
+test('libby also handles a resolved response-too-large relay error', async () => {
   const handler = libbyOk({
     before: (method, url) => {
-      // What the device returns when a response exceeds its 32 KB buffer.
+      // Older hosts can resolve an error object rather than throwing HTTP 502.
       if (url.endsWith('/chip/sync')) return { error: 'response too large, use /api/fetch' };
       return null;
     },
   });
-  const { document } = await renderLibby({ libbyHandler: handler, storedLibby: LINKED });
+  const { document, state } = await renderLibby({ libbyHandler: handler, storedLibby: LINKED });
 
-  const status = document.elements['lib-status'].textContent;
-  assert.match(status, /more data than this device can/);
-  assert.equal(/api\/fetch/.test(status), false, 'internal advice should not reach the user');
+  assert.match(document.elements['lby-loans'].innerHTML, /Adobe Book/);
+  assert.equal(state.downloads.length, 1);
+  assert.equal(state.syncFiles.size, 0);
+});
+
+function oversizedSync(overrides = {}) {
+  return libbyOk({ before: (method, url, headers, body, state) => {
+    const r = overrides.before?.(method, url, headers, body, state);
+    if (r) return r;
+    if (url.endsWith('/chip/sync')) {
+      throw new Error('/api/relay 502: relay failed; large bodies need /api/fetch');
+    }
+  } });
+}
+
+test('libby uses no temporary file when the relay can hold the sync', async () => {
+  const { state } = await renderLibby({ libbyHandler: libbyOk(), storedLibby: LINKED });
+  assert.equal(state.downloads.length, 0);
+  assert.equal(state.deletes.length, 0);
+});
+
+test('libby uses the refreshed token when the retried sync needs SD', async () => {
+  let expired = true;
+  const { document, state } = await renderLibby({
+    storedLibby: LINKED,
+    libbyHandler: oversizedSync({ before: (method, url) => {
+      if (url.endsWith('/chip/sync') && expired) {
+        expired = false;
+        return { status: 403, body: '{"result":"missing_chip"}' };
+      }
+    } }),
+  });
+  assert.match(document.elements['lby-loans'].innerHTML, /Adobe Book/);
+  assert.notEqual(state.storedLibby.identity, LINKED.identity);
+  assert.equal(state.downloads[0].headers.Authorization, 'Bearer ' + state.storedLibby.identity);
+});
+
+test('libby leaves unrelated relay errors alone', async () => {
+  const { document, state } = await renderLibby({
+    storedLibby: LINKED,
+    libbyHandler: libbyOk({ before: (method, url) => {
+      if (url.endsWith('/chip/sync')) throw new Error('/api/relay 403: plugins disabled');
+    } }),
+  });
+  assert.equal(state.downloads.length, 0);
+  assert.match(document.elements['lib-status'].textContent, /plugins disabled/);
+});
+
+test('libby removes temporary files after malformed JSON or a failed read', async () => {
+  for (const options of [
+    { syncDownload: async () => ({ status: 200, body: '<not-json>' }), expected: /non-JSON reply/ },
+    { syncRead: async () => response({ status: 500 }), expected: /could not read your library/ },
+  ]) {
+    const { document, state } = await renderLibby({
+      storedLibby: LINKED, libbyHandler: oversizedSync(), ...options,
+    });
+    assert.match(document.elements['lib-status'].textContent, options.expected);
+    assert.equal(state.syncFiles.size, 0);
+    assert.ok(state.deletes.includes(state.downloads[0].dest));
+  }
+});
+
+test('libby cleans a failed download and never falls back to a previous sync', async () => {
+  let attempts = 0;
+  const { document, state } = await renderLibby({
+    storedLibby: LINKED, libbyHandler: oversizedSync(),
+    syncDownload: async (url, dest, headers, state) => {
+      if (attempts++ === 0) return { status: 200, body: JSON.stringify(SYNC_PAYLOAD) };
+      state.syncFiles.set(dest + '.part', 'partial library');
+      throw new Error('/api/fetch 502: download truncated');
+    },
+  });
+  assert.match(document.elements['lby-loans'].innerHTML, /Adobe Book/);
+  await document.elements['lby-refresh'].onclick();
+  assert.match(document.elements['lib-status'].textContent, /download truncated/);
+  assert.equal(document.elements['lby-get'].disabled, true);
+  assert.equal(state.downloads.length, 2);
+  assert.notEqual(state.downloads[0].dest, state.downloads[1].dest);
+  assert.equal(state.syncFiles.size, 0);
+  assert.ok(state.deletes.includes(state.downloads[1].dest + '.part'));
+});
+
+test('libby rejects failed or incomplete SD results', async () => {
+  for (const result of [
+    { status: 200, error: 'sd write failed' },
+    { status: 200, complete: false, body: 'partial' },
+  ]) {
+    const { document, state } = await renderLibby({
+      storedLibby: LINKED, libbyHandler: oversizedSync(),
+      syncDownload: async () => result,
+    });
+    assert.match(document.elements['lib-status'].textContent, /could not download your library/);
+    assert.equal(document.elements['lby-get'].disabled, true);
+    assert.equal(state.syncFiles.size, 0);
+  }
+});
+
+test('libby reports a cleanup failure after reading a successful sync', async () => {
+  const { document, state } = await renderLibby({
+    storedLibby: LINKED, libbyHandler: oversizedSync(),
+    syncDelete: async () => response({ status: 500 }),
+  });
+  assert.match(document.elements['lib-status'].textContent, /could not remove the temporary library file/);
+  assert.ok(state.deletes.includes(state.downloads[0].dest + '.part'));
 });

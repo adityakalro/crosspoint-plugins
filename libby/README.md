@@ -47,6 +47,10 @@ your library card.
   publisher; those download directly and have no expiry beyond the loan.
 - Your Libby link and your account credential are both stored on the SD card,
   so keep the card somewhere safe.
+- Large libraries may take an extra request to load. If the device's relay
+  buffer cannot hold the library response, the plugin downloads it to a unique
+  temporary file under `/.crosspoint/plugins/libby/`, reads it in the browser,
+  and deletes it. Keep enough space free on the SD card for this response.
 
 ## If Libby stops responding
 

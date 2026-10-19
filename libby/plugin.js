@@ -223,13 +223,63 @@ CrossPoint.registerPlugin(async (container, api) => {
     throw new Error('relay: ' + r.error);
   }
 
+  async function syncFromSd(url, headers) {
+    // Sync can be hundreds of KB. Keep it out of the firmware's 32 KB relay
+    // buffer, then stream the completed file to the browser for JSON parsing.
+    // Each call owns its file, so concurrent pages cannot read/delete another
+    // request's response. Never reuse a previous sync after a failed download.
+    const path = '/.crosspoint/plugins/libby/sync-' + Date.now().toString(36) +
+      '-' + Math.random().toString(36).slice(2) + '.json';
+    let response;
+    try {
+      const result = await api.fetchToSd(url, path, headers);
+      // /api/fetch discards non-2xx bodies. Read the small refusal via relay
+      // so missing_chip recovery and client_upgrade_required keep working.
+      if (result.status >= 400 && result.status < 600) {
+        return await relayFollow('GET', url, headers, '');
+      }
+      if (result.error || result.complete === false || result.status < 200 || result.status >= 300) {
+        throw new Error('could not download your library: ' + (result.error || ('HTTP ' + result.status)));
+      }
+      const file = await fetch('/download?path=' + encodeURIComponent(path));
+      if (!file.ok) throw new Error('could not read your library (HTTP ' + file.status + ')');
+      response = { status: result.status, headers: [], body: await file.text() };
+    } finally {
+      // A failed fetch may leave .part behind. Cleanup must not hide the
+      // original error, but failure to remove a successfully read sync matters.
+      let cleanupFailed = false;
+      try { await deleteFile(path); }
+      catch (e) {
+        cleanupFailed = !!response;
+      }
+      try { await deleteFile(path + '.part'); } catch (e) { /* absent after a completed fetch */ }
+      if (cleanupFailed) throw new Error('could not remove the temporary library file: ' + path);
+    }
+    return response;
+  }
+
+  async function libbyRelay(method, url, body, extra) {
+    const headers = libbyHeaders(extra);
+    const sync = method === 'GET' && url === LIBBY_BASE + '/chip/sync';
+    try {
+      const r = await relayFollow(method, url, headers, body || '');
+      if (!sync || !r.error || !/too large/i.test(String(r.error))) return r;
+    } catch (e) {
+      // The web host throws on the device's HTTP 502 before checkRelay sees a
+      // response. This message can also mean a transport/allocation failure;
+      // retry only this idempotent GET, once, using the streaming API.
+      if (!sync || !/\/api\/relay 502: relay failed; large bodies need \/api\/fetch/i.test(e.message)) throw e;
+    }
+    return syncFromSd(url, headers);
+  }
+
   async function libbyRequest(method, url, body, extra) {
-    let r = await relayFollow(method, url, libbyHeaders(extra), body || '');
+    let r = await libbyRelay(method, url, body, extra);
     checkRelay(r, url.replace(LIBBY_BASE, '') || url);
     if (r.status === 403 && libbyResult(r) === 'missing_chip') {
       await rechip(true);
       await saveLibbyConfig();
-      r = await relayFollow(method, url, libbyHeaders(extra), body || '');
+      r = await libbyRelay(method, url, body, extra);
       checkRelay(r, url.replace(LIBBY_BASE, '') || url);
     }
     return r;
